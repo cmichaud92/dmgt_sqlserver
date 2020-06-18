@@ -1,0 +1,688 @@
+---
+title: "SQLserver build"
+author: "Chris Michaud"
+date: "12/12/2019"
+output: html_document
+---
+
+```{r setup}
+
+dw <- config::get("datawarehouse")
+
+
+con <- DBI::dbConnect(odbc::odbc(),
+                 Driver = dw$driver,
+                 Server = dw$server,
+                 UID    = dw$uid,
+                 PWD    = dw$pwd,
+                 Port   = dw$port,
+                 Database = dw$database
+)
+
+# con <- DBI::dbConnect(odbc::odbc(), 
+#                       Driver = "SQL Server", 
+#                       Server = "localhost\\SQLEXPRESS", 
+#                       Database = "moab_db", 
+#                       Trusted_Connection = "True")
+
+knitr::opts_chunk$set(connection = "con", # Store DBI connection globaly
+                      warning = FALSE,
+                      message = FALSE)  
+
+library(DBI)
+library(dplyr)      # data manipulations
+library(dbplyr)     # extends dplyr functions to database 
+library(lubridate)  # date-time manipulations
+
+#dbDisconnect(con)
+```
+
+
+```{r drop-tables, eval=FALSE}
+# db_drop_table(con, "principal")
+# db_drop_table(con, "project")
+# db_drop_table(con, "site")
+# db_drop_table(con, "pi_proj")
+# db_drop_table(con, "site")
+# db_drop_table(con, "study")
+# db_drop_table(con, "water_qual")
+# dbListTables(con)
+```
+
+# General upper level tables
+
+These house general information about projects, principal investigators and effort type
+
+### Principal investigator table
+
+Information on all PI's past and present associated with ongoing projects at MFO
+
+```{sql principles-tbl}
+CREATE TABLE principal (
+principal_id smallint NOT NULL PRIMARY KEY,
+first_name varchar(20) NOT NULL,
+last_name varchar(30) NOT NULL,
+start_date date NOT NULL,
+end_date date,
+title varchar(50) 
+);
+
+```
+
+### Project table
+
+Project information related to current ongoing research efforts at MFO.  We will eventually load historic datasets and data from abandoned projects
+
+```{sql project-tbl}
+CREATE TABLE project (
+proj_id SMALLINT NOT NULL PRIMARY KEY,
+proj_code VARCHAR(30) NOT NULL UNIQUE,
+proj_title VARCHAR(255) NOT NULL,
+proj_type VARCHAR(50),
+target_spp VARCHAR(50),
+proj_desc VARCHAR(MAX)
+);
+
+```
+
+
+### Principal_project table
+
+This is a linking table created to resolve m:n relationship between Principal and Project tables
+
+```{sql, pi-proj-tbl}
+CREATE TABLE pi_proj (
+pi_proj_id SMALLINT NOT NULL PRIMARY KEY,
+principal_id SMALLINT NOT NULL,
+proj_id SMALLINT NOT NULL,
+FOREIGN KEY (proj_id) REFERENCES project(proj_id),
+FOREIGN KEY (principal_id) REFERENCES principal(principal_id)
+);
+```
+
+### site table
+
+Implements JSON text column to deal with disparate data from various project types
+
+**NOTE** JSON col must be the last column (far right or `collect()` triggers an ODBC error: `Invalid Descriptor Index`)
+
+```{sql site-tbl}
+CREATE TABLE site (
+site_id VARCHAR(50) NOT NULL PRIMARY KEY,
+pi_proj_id SMALLINT NOT NULL,
+river VARCHAR(10) NOT NULL,
+reach VARCHAR(10) NOT NULL,
+crew VARCHAR(20),
+site_notes VARCHAR(255),
+FOREIGN KEY (pi_proj_id) REFERENCES pi_proj(pi_proj_id)
+);
+
+```
+
+___
+
+### water_qual table
+
+```{sql water-qual-tbl}
+CREATE TABLE water_qual (
+water_qual_id INT NOT NULL IDENTITY(1,1) PRIMARY KEY,
+site_id VARCHAR(50) NOT NULL,
+cond_amb SMALLINT,
+cond_spec SMALLINT,
+temp DECIMAL(4, 1),
+secchi SMALLINT,
+water_notes VARCHAR(255)
+FOREIGN KEY (site_id) REFERENCES site(site_id)
+);
+```
+
+
+
+___
+
+### sample table
+
+```{sql site-tbl}
+CREATE TABLE sample (
+sample_id VARCHAR(50) NOT NULL PRIMARY KEY,
+site_id VARCHAR(50) NOT NULL,
+data_type VARCHAR(5) NOT NULL CHECK (data_type IN ('EL', 'TR', 'SE', 'PA')), -- I think this is for parsing and identifies EF, SE, TR, ANT 
+gear VARCHAR(10) NOT NULL,
+sample_json NVARCHAR(MAX) NOT NULL,
+FOREIGN KEY (site_id) REFERENCES site(site_id)
+);
+
+```
+
+
+___
+
+### encounter table
+
+```{sql encounter-tbl}
+CREATE TABLE encounter (
+encounter_id VARCHAR(50) NOT NULL PRIMARY KEY,
+sample_id VARCHAR(50) NOT NULL,
+species VARCHAR(10) NOT NULL CHECK (species IN ('BCT', 'BH', 'BHRZ', 'BT', 'CH', 'CS', 'FB', 'FM', 'FR', 'HB', 'MF', 'RT', 'RZ', 'SD', 'SU', 'BB', 'BC', 'BG', 'BN', 'BS', 'CC', 'CP', 'FH', 'GA', 'GC', 'GS', 'GZ', 'KO', 'LG', 'NP', 'PK', 'RB', 'RD', 'RS', 'SB', 'SM', 'SS', 'UC', 'WB', 'WC', 'WE', 'WF', 'WS', 'YB', 'YP', 'UI', 'UM', 'OT', 'UNK')),
+tot_length SMALLINT CHECK (tot_length != 0),
+st_length SMALLINT CHECK (st_length != 0),
+weight SMALLINT CHECK (weight != 0),
+sex VARCHAR CHECK(10) (sex IN ('F', 'M', 'I', NULL)),
+reprod_cond VARCHAR(10) CHECK (reprod_cond IN ('INT_EGG', 'INT_MILT', 'EXP_EGG', 'EXP_MILT' 'NOT', 'SPENT', NULL)),
+tubercles VARCHAR(10) CHECK (tubercles IN ('Y', 'N', NULL)),
+ray_ct VARCHAR(50),
+disp VARCHAR(10) CHECK (disp IN ('CT', 'DE', 'RT', 'FC', 'HA', 'DF', 'SS', 'DP', 'RA', 'TR', 'TL', 'UNK', 'OT')),
+notes_fish VARCHAR(255),
+FOREIGN KEY (sample_id) REFERENCES sample(se_effort_id)
+);
+```
+
+
+
+
+The following tables house all field data collected under all MFO projects 
+
+___
+
+## Sampling Type : **seining**
+
+The seining branch of the Moab_db includes all efforts from Project 138 (ISMP and Nursery Habitat Pilot Study) and the seining task from Project 160 (Razorback recruitment investigation).
+
+### Seining site table
+
+This table includes only spatial-temporal data common to all projects. 
+
+```{sql se-site-tbl}
+CREATE TABLE se_site (
+se_site_id TEXT NOT NULL UNIQUE PRIMARY KEY, 
+project_id TEXT NOT NULL,
+samp_type_id TEXT NOT NULL,
+year INTEGER NOT NULL,
+river TEXT NOT NULL,
+reach TEXT NOT NULL,
+pass INTEGER,
+date TEXT,
+loc_x REAL,
+loc_y REAL,
+epsg INTEGER,
+rmi INTEGER,
+crew TEXT,
+notes_site TEXT,
+FOREIGN KEY (project_id, samp_type_id) REFERENCES proj_samp_type(project_id, samp_type_id)
+);
+```
+
+### Seining water quality table
+
+This could be integrated into the site data (historic precident) or as a child table to the site table
+
+```{sql se-water-tbl}
+CREATE TABLE se_water (
+se_water_id INTEGER NOT NULL UNIQUE PRIMARY KEY,
+se_site_id TEXT NOT NULL,
+amb_cond INTEGER,
+spec_cond INTEGER,
+temp DECIMAL (4, 1),
+secchi INTEGER,
+dis_o REAL,
+FOREIGN KEY (se_site_id) REFERENCES se_site(se_site_id)
+);
+```
+
+### Seining habitat table
+
+Table contains all habitat vars from all projects in one table, in general most will contain values, however, a few will be NULL.
+
+```{sql se_site_hab}
+CREATE TABLE se_site_hab (
+se_site_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+hab_1 TEXT NOT NULL CHECK (hab_1 IN ('MC', 'SC', 'LK', 'OI', 'GP', 'ID', 'FB', 'OT', 'UNK')),
+hab_2 TEXT CHECK (hab_2 IN ('BA', 'MB', 'CC', 'CO', 'CV', 'ED', 'EM', 'CM', 'FT', 'IT', 
+                            'IP', 'MC', 'PO', 'PU', 'RI', 'RF', 'RU', 'SH', 'SC', 'MT', 'TS', 'OT', 'UNK')),
+hab_geom TEXT,
+hab_length INTEGER,
+hab_width INTEGER,
+hab_mx_dep INTEGER,
+hab_secchi INTEGER,
+hab_temp REAL,
+prim_sec INTEGER,
+aspect INTEGER,
+cover_type TEXT,
+pct_cover INTEGER,
+FOREIGN KEY (se_site_id) REFERENCES se_site(se_site_id)
+);
+
+```
+
+### Transect data table from nursery habitat study
+
+```{sql se_trans}
+CREATE TABLE se_trans (
+se_trans_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+se_site_id TEXT NOT NULL,
+location TEXT, 
+flow TEXT CHECK (flow IN('Y', 'N')),
+width INTEGER,
+secchi INTEGER,
+temp DECIMAL (4, 1),
+d1_depth INTEGER,
+d1_tot_dep INTEGER,
+d1_sub1 TEXT,
+d1_sub2 TEXT,
+d2_depth INTEGER,
+d2_tot_dep INTEGER,
+d2_sub1 TEXT,
+d2_sub2 TEXT,
+dmax_depth INTEGER,
+dmax_tot_dep INTEGER,
+dmax_sub1 TEXT,
+dmax_sub2 TEXT,
+notes_trans TEXT,
+FOREIGN KEY (se_site_id) REFERENCES se_site(se_site_id)
+);
+```
+
+### Seining effort table
+
+seining effort is composed of the length and width of the seine haul.  Area is calculated during analysis
+
+```{sql se-effort-tbl}
+CREATE TABLE se_effort (
+se_effort_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+se_site_id TEXT NOT NULL,
+haul_length INTEGER,
+haul_width REAL,
+notes_effort TEXT,
+FOREIGN KEY (se_site_id) REFERENCES se_site(se_site_id)
+);
+
+```
+
+### Project 138 (ISMP) haul measurements table.
+
+This data table captures all ISMP and NHS specific haul measurments.
+
+```{sql ismp-haul-tbl}
+CREATE TABLE ismp_haul (
+se_effort_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+method TEXT CHECK (method IN ('A', 'P', 'OT', 'UNK')),
+mud_depth INTEGER,
+dmax_depth INTEGER,
+dmax_sub_1 TEXT,
+dmax_sub_2 TEXT,
+d1_depth INTEGER,
+d1_sub_1 TEXT,
+d1_sub_2 TEXT
+d2_depth INTEGER,
+d2_sub_1 TEXT,
+d2_sub_2 TEXT,
+FOREIGN KEY (se_effort_id) REFERENCES se_effort(se_effort_id)
+);
+
+```
+
+### Project 160 (RZSE) haul measurements
+
+This table stores all specific P160 haul measurements
+
+```{sql rzse-haul-tbl}
+CREATE TABLE rzse_haul (
+se_effort_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+haul_max_dep INTEGER,
+haul_avr_dep INTEGER,
+sub_1 TEXT,
+sub_2 TEXT,
+fh TEXT CHECK (fh IN ('Y', 'N', NULL)),
+rs TEXT CHECK (rs IN ('Y', 'N', NULL)),
+SS TEXT CHECK (ss IN ('Y', 'N', NULL)),
+FOREIGN KEY (se_effort_id) REFERENCES se_effort(se_effort_id)
+);
+
+```
+
+### Seining count table.
+
+This table includes ALL fish encounters including those measured to length and stored in the encounter table.  Fish counts stored as collected: total number per individual seine haul.  Or does it make more sense to store only counted fish here.  Researcher would have to derive and add fish count from *se_biomet* table to generate "total" count...
+
+```{sql se-count-tbl}
+CREATE TABLE se_count (
+se_count_id INTEGER NOT NULL UNIQUE PRIMARY KEY,
+se_effort_id TEXT NOT NULL,
+species TEXT NOT NULL,
+fish_count INTEGER NOT NULL,
+notes_count TEXT,
+FOREIGN KEY (se_effort_id) REFERENCES se_effort(se_effort_id)
+);
+```
+
+### Seining tissue table
+
+This table houses all data regarding tissue samples collected.  se_effort to se_tissue = 1:m. **NOTE** all tissue tables are identical, the only differences are their foreign key references.
+
+```{sql se-tissue-tbl}
+CREATE TABLE se_tissues (
+se_tissue_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+se_effort_id TEXT NOT NULL,
+type_of_sample TEXT,
+other_tissue_number TEXT,
+notes_tissue TEXT,
+FOREIGN KEY (se_effort_id) REFERENCES se_effort(se_effort_id)
+);
+```
+
+
+### Seining fish table
+
+Must include all traditional biomet metrics becuase we occasionaly encounter full-sized fish.  **NOTE** this is a standard fish measurement table. It is identical to the tr_fish table and similar to the el_fish table.  Most values besides `species`, `tot_length` and `disp` will be null.
+
+```{sql se_fish-tbl}
+CREATE TABLE se_fish (
+se_fish_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+se_effort_id TEXT NOT NULL,
+species TEXT NOT NULL CHECK (species IN ('BCT', 'BH', 'BHRZ', 'BT', 'CH', 'CS', 'FB', 'FM', 'FR', 'HB', 'MF', 'RT', 'RZ', 'SD', 'SU', 'BB', 'BC', 'BG', 'BN', 'BS', 'CC', 'CP', 'FH', 'GA', 'GC', 'GS', 'GZ', 'KO', 'LG', 'NP', 'PK', 'RB', 'RD', 'RS', 'SB', 'SM', 'SS', 'UC', 'WB', 'WC', 'WE', 'WF', 'WS', 'YB', 'YP', 'OT', 'UNK')),
+tot_length INTEGER CHECK (tot_length != 0),
+st_length INTEGER CHECK (st_length != 0),
+weight INTEGER CHECK (weight != 0),
+sex TEXT CHECK (sex IN ('F', 'M', 'I', NULL)),
+ripe TEXT CHECK (ripe IN ('Y', 'N', NULL)),
+tubercles TEXT CHECK (tubercles IN ('Y', 'N', NULL)),
+ray_ct TEXT,
+disp TEXT CHECK (disp IN ('CT', 'DE', 'RT', 'FC', 'HA', 'DF', 'SS', 'DP', 'RA', 'TR', 'TL', 'UNK', 'OT')),
+notes_fish TEXT,
+FOREIGN KEY (se_effort_id) REFERENCES se_effort(se_effort_id)
+);
+```
+
+### Seining tag table
+
+This is a key (column) value pair table.  see how this works... se_encounter - se_tag = 1:m. **NOTE** tag tables are identical throughout the database.
+
+```{sql se-tag-tbl}
+CREATE TABLE se_tags (
+se_tag_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+se_fish_id TEXT NOT NULL,
+tag_type TEXT NOT NULL,
+tag_recap TEXT NOT NULL CHECK (tag_recap IN ('Y', 'N', 'NNF', 'UNK')),
+tagid TEXT, 
+tag_color TEXT,
+FOREIGN KEY (se_fish_id) REFERENCES se_fish(se_fish_id)
+);
+```
+
+___
+
+## Sampling Type : **electrofishing**
+
+The electrofishing branch of the Moab_db includes all efforts from Projects 123a, 123d, 128, san juan efforts, and the electrofishing task of 132 (Westwater Humpback chub population estimates).
+
+### Electrofishing site-effort table
+
+Electrofishing lends its self to a simple data structure.  The Spatial-temporal and effort data reside on the same table
+
+```{sql el-site-effort-tbl}
+CREATE TABLE el_site_effort (
+el_effort_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+project_id TEXT NOT NULL,
+samp_type_id TEXT NOT NULL,
+year INTEGER NOT NULL,
+startdatetime TEXT,
+enddatetime TEXT,
+start_rmi REAL NOT NULL,
+end_rmi REAL NOT NULL,
+shoreline TEXT,
+el_sec INTERGER,
+boat TEXT,
+crew TEXT,
+notes_site TEXT,
+FOREIGN KEY (project_id, samp_type_id) REFERENCES proj_samp_type(project_id, samp_type_id)
+);
+```
+
+
+
+### Electrofishing fish encounter table
+
+Includes all physical measurements recorded, spatial and temporal data on each encounter
+
+```{sql el-fish-tbl}
+CREATE TABLE el_fish (
+el_fish_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+el_effort_id TEXT NOT NULL,
+species TEXT NOT NULL CHECK (species IN ('BCT', 'BH', 'BHRZ', 'BT', 'CH', 'CS', 'FB', 'FM', 'FR', 'HB', 'MF', 'RT', 'RZ', 'SD', 'SU', 'BB', 'BC', 'BG', 'BN', 'BS', 'CC', 'CP', 'FH', 'GA', 'GC', 'GS', 'GZ', 'KO', 'LG', 'NP', 'PK', 'RB', 'RD', 'RS', 'SB', 'SM', 'SS', 'UC', 'WB', 'WC', 'WE', 'WF', 'WS', 'YB', 'YP', 'OT', 'UNK')),
+tot_length INTEGER CHECK (tot_length != 0),
+st_length INTEGER CHECK (st_length != 0),
+weight INTEGER CHECK (weight != 0),
+sex TEXT CHECK (sex IN ('F', 'M', 'I', NULL)),
+ripe TEXT CHECK (ripe IN ('Y', 'N', NULL)),
+tubercles TEXT CHECK (tubercles IN ('Y', 'N', NULL)),
+ray_ct TEXT,
+disp TEXT CHECK (disp IN ('CT', 'DE', 'RT', 'FC', 'HA', 'DF', 'SS', 'DP', 'RA', 'TR', 'TL', 'UN', 'OT', 'UNK')),
+date_time TEXT,
+rmi REAL,
+loc_x REAL CHECK (loc_x != 0),
+loc_y REAL CHECK (loc_y != 0),
+epsg INTEGER,
+notes_fish TEXT,
+FOREIGN KEY (el_effort_id) REFERENCES el_site_effort(el_effort_id)
+);
+```
+
+### Electrofishing tag table
+
+Key-value paring because a given fish may have no pit and multiple floy tags...
+
+```{sql el-tag-tbl}
+CREATE TABLE el_tags (
+el_tag_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+el_fish_id TEXT NOT NULL,
+tag_type TEXT NOT NULL,
+tag_recap TEXT NOT NULL CHECK (tag_recap IN ('Y', 'N', 'NNF', 'UNK')),
+tagid TEXT, 
+tag_color TEXT,
+FOREIGN KEY (el_fish_id) REFERENCES el_fish(el_fish_id)
+);
+```
+
+### Electrofishing tissue table
+
+```{sql el-tissue-tbl}
+CREATE TABLE el_tissue (
+el_tissue_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+el_fish_id TEXT NOT NULL,
+tissue_type TEXT NOT NULL,
+other_tissue_number TEXT,
+FOREIGN KEY (el_fish_id) REFERENCES el_fish(el_fish_id)
+);
+```
+
+___
+
+## Sampling Type : **portable pittag antenna**
+
+The portable pittag antenna branch of the Moab_db includes all antenna data from from Projects 129 and 132.  Because fish are never handled no measurements are taken.  The species is determined post hoc using STReaMS.
+
+### Portable antenna site-effort table
+
+Portable antenna data lends its self to a simple structure.  The site data and effort data reside on the same table
+
+```{sql ant-site-effort-tbl}
+CREATE TABLE ant_site_effort (
+ant_effort_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+project_id TEXT NOT NULL,
+samp_type_id TEXT NOT NULL,
+year INTEGER NOT NULL,
+startdatetime TEXT NOT NULL,
+enddatetime TEXT NOT NULL,
+rmi REAL NOT NULL,
+loc_x REAL CHECK (loc_x != 0),
+loc_y REAL CHECK (loc_y != 0),
+epsg INTEGER,
+shoreline TEXT,
+notes_site TEXT,
+FOREIGN KEY (project_id, samp_type_id) REFERENCES proj_samp_type(project_id, samp_type_id)
+);
+```
+
+
+
+### Portable antenna encounter table
+
+This table includes all individuals handled within each site-effort entry. It includes the datetime of encounter.  We need to determine the best detection interval to aggregate to (1 detection per hour, per day, per minute...)
+
+```{sql ant-encounter-tbl}
+CREATE TABLE ant_encounter (
+ant_enc_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+ant_effort_id TEXT NOT NULL,
+datetime TEXT NOT NULL,
+pit_134 TEXT NOT NULL,
+species TEXT NOT NULL CHECK (species IN ('BCT', 'BH', 'BHRZ', 'BT', 'CH', 'CS', 'FB', 'FM', 'FR', 'HB', 'MF', 'RT', 'RZ', 'SD', 'SU', 'BB', 'BC', 'BG', 'BN', 'BS', 'CC', 'CP', 'FH', 'GA', 'GC', 'GS', 'GZ', 'KO', 'LG', 'NP', 'PK', 'RB', 'RD', 'RS', 'SB', 'SM', 'SS', 'UC', 'WB', 'WC', 'WE', 'WF', 'WS', 'YB', 'YP', 'OT', 'UNK')),
+FOREIGN KEY (ant_effort_id) REFERENCES ant_site_effort(ant_effort_id)
+);
+
+```
+
+___
+
+## Sampling Type : **traps and other nets**
+
+Trap branch of the Moab_db includes all data collected using trammel, fyke and hoop nets and light traps.
+
+### Trap site table
+
+Records general data from sampling area ie. cow-swim, NOT net specific
+
+```{sql tr-site-tbl, connection = con}
+CREATE TABLE tr_site (
+tr_site_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+project_id TEXT NOT NULL,
+samp_type_id TEXT NOT NULL,
+year INTEGER NOT NULL,
+pass INTEGER,
+river TEXT NOT NULL,
+reach TEXT NOT NULL,
+FOREIGN KEY (project_id, samp_type_id) REFERENCES proj_samp_type(project_id, samp_type_id)
+);
+
+```
+
+### Trap water quality table
+
+same as other water quality tables
+
+```{sql tr-water-tbl}
+CREATE TABLE tr_water(
+tr_water_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+tr_site_id TEXT NOT NULL,
+amb_cond TEXT,
+spec_cond TEXT,
+temp REAL,
+secchi INTERGER,
+FOREIGN KEY (tr_site_id) REFERENCES tr_site(tr_site_id)
+);
+```
+
+### Trap net table
+
+Data on each specific trap set
+
+```{sql tr-net-tbl}
+CREATE TABLE tr_net (
+tr_net_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+tr_site_id TEXT NOT NULL,
+gear TEXT NOT NULL CHECK (gear IN ('TR', 'HP', 'LT', 'FK', 'OT', 'UNK')),
+hab_1 TEXT NOT NULL CHECK (hab_1 IN ('MC', 'SC', 'LK', 'OI', 'GP', 'ID', 'FB', 'UNK', 'OT')),
+hab_2 TEXT NOT NULL CHECK (hab_2 IN ('BA', 'MB', 'CC', 'CO', 'CV', 'ED', 'EM', 'CM', 'FT', 'IT', 
+                            'IP', 'MC', 'PO', 'PU', 'RI', 'RF', 'RU', 'SH', 'SC', 'MT', 'TS', 'OT', 'UNK')),
+shoreline TEXT NOT NULL CHECK (shoreline IN ('L', 'R', 'OT', 'UNK')),
+loc_x REAL CHECK (loc_x != 0),
+loc_y REAL CHECK (loc_y != 0),
+epsg INTEGER, 
+FOREIGN KEY (tr_site_id) REFERENCES tr_site(tr_site_id)
+);
+
+```
+
+### Trap effort table
+
+The effort is recorded as a time interval between set_datetime and check_datetime 
+
+```{sql tr-effort-tbl}
+CREATE TABLE tr_effort (
+tr_effort_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+tr_net_id TEXT NOT NULL,
+set_datetime TEXT NOT NULL,
+ck_datetime TEXT NOT NULL,
+notes_effort TEXT,
+FOREIGN KEY (tr_net_id) REFERENCES tr_net(tr_net_id)
+);
+```
+
+### Trap count table
+
+This table records total count of all individuals of all species encountered
+
+```{sql tr-count-tbl}
+CREATE TABLE tr_count (
+tr_count_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+tr_effort_id TEXT NOT NULL,
+species TEXT NOT NULL CHECK (species IN ('BCT', 'BH', 'BHRZ', 'BT', 'CH', 'CS', 'FB', 'FM', 'FR', 'HB', 'MF', 'RT', 'RZ', 'SD', 'SU', 'BB', 'BC', 'BG', 'BN', 'BS', 'CC', 'CP', 'FH', 'GA', 'GC', 'GS', 'GZ', 'KO', 'LG', 'NP', 'PK', 'RB', 'RD', 'RS', 'SB', 'SM', 'SS', 'UC', 'WB', 'WC', 'WE', 'WF', 'WS', 'YB', 'YP', 'OT', 'UNK')),
+fish_count INTEGER NOT NULL CHECK (fish_count != 0),
+notes_count TEXT,
+FOREIGN KEY (tr_effort_id) REFERENCES tr_effort(tr_effort_id)
+)
+
+```
+
+
+### Trap fish encounter table
+
+```{sql tr-fish-tbl}
+CREATE TABLE tr_fish (
+tr_fish_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+tr_effort_id TEXT NOT NULL,
+species TEXT NOT NULL CHECK (species IN ('BCT', 'BH', 'BHRZ', 'BT', 'CH', 'CS', 'FB', 'FM', 'FR', 'HB', 'MF', 'RT', 'RZ', 'SD', 'SU', 'BB', 'BC', 'BG', 'BN', 'BS', 'CC', 'CP', 'FH', 'GA', 'GC', 'GS', 'GZ', 'KO', 'LG', 'NP', 'PK', 'RB', 'RD', 'RS', 'SB', 'SM', 'SS', 'UC', 'WB', 'WC', 'WE', 'WF', 'WS', 'YB', 'YP', 'OT', 'UNK')),
+tot_length INTEGER CHECK (tot_length != 0),
+st_length INTEGER CHECK (st_length != 0),
+weight INTEGER CHECK (weight != 0),
+sex TEXT CHECK (sex IN ('F', 'M', 'I', NULL)),
+ripe TEXT CHECK (ripe IN ('Y', 'N', NULL)),
+tubercles TEXT CHECK (tubercles IN ('Y', 'N', NULL)),
+ray_ct TEXT,
+disp TEXT CHECK (disp IN ('CT', 'DE', 'RT', 'FC', 'HA', 'DF', 'SS', 'DP', 'RA', 'TR', 'TL', 'UN', 'OT', 'UNK')),
+FOREIGN KEY (tr_effort_id) REFERENCES tr_effort(tr_effort_id)
+);
+
+```
+
+### Trap tag table
+
+Key value paring because a given fish may have no pit and multiple floy tags...
+
+```{sql tr-tag-tbl}
+CREATE TABLE tr_tags (
+tr_tag_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+tr_fish_id TEXT NOT NULL,
+tag_type TEXT NOT NULL,
+tag_recap TEXT NOT NULL CHECK (tag_recap IN ('Y', 'N', 'NNF', 'UNK')),
+tagid TEXT, 
+tag_color TEXT,
+FOREIGN KEY (tr_fish_id) REFERENCES tr_fish(tr_fish_id)
+);
+```
+
+### Trap tissue table
+
+```{sql tr-tissue-tbl}
+CREATE TABLE tr_tissue (
+tr_tissue_id TEXT NOT NULL UNIQUE PRIMARY KEY,
+tr_fish_id TEXT NOT NULL,
+tissue_type TEXT NOT NULL,
+other_tissue_number TEXT,
+FOREIGN KEY (tr_fish_id) REFERENCES tr_fish(tr_fish_id)
+);
+```
+
+```{r}
+dbDisconnect(con)
+```
+
