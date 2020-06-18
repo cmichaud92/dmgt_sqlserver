@@ -9,6 +9,7 @@ z_archive
 *.yml
 *.html
 *.doc
+*.Rproj
 
 
 # History files
