@@ -19,12 +19,6 @@ con <- DBI::dbConnect(odbc::odbc(),
                  Database = dw$database
 )
 
-# con <- DBI::dbConnect(odbc::odbc(), 
-#                       Driver = "SQL Server", 
-#                       Server = "localhost\\SQLEXPRESS", 
-#                       Database = "moab_db", 
-#                       Trusted_Connection = "True")
-
 knitr::opts_chunk$set(connection = "con", # Store DBI connection globaly
                       warning = FALSE,
                       message = FALSE)  
@@ -49,13 +43,13 @@ library(lubridate)  # date-time manipulations
 # dbListTables(con)
 ```
 
-# General upper level tables
+# Meta tables
 
 These house general information about projects, principal investigators and effort type
 
-### Principal investigator table
+## Principal investigator table `principal`
 
-Information on all PI's past and present associated with ongoing projects at MFO
+Pertenant information on all PI's associated with both past and ongoing projects at MFO
 
 ```{sql principles-tbl}
 CREATE TABLE principal (
@@ -64,18 +58,17 @@ first_name varchar(20) NOT NULL,
 last_name varchar(30) NOT NULL,
 start_date date NOT NULL,
 end_date date,
-title varchar(50) 
 );
 
 ```
 
-### Project table
+## Project table `project`
 
 Project information related to current ongoing research efforts at MFO.  We will eventually load historic datasets and data from abandoned projects
 
 ```{sql project-tbl}
 CREATE TABLE project (
-proj_id SMALLINT NOT NULL PRIMARY KEY,
+project_id SMALLINT NOT NULL PRIMARY KEY,
 proj_code VARCHAR(30) NOT NULL UNIQUE,
 proj_title VARCHAR(255) NOT NULL,
 proj_type VARCHAR(50),
@@ -86,9 +79,9 @@ proj_desc VARCHAR(MAX)
 ```
 
 
-### Principal_project table
+### Principal_project table `pi_proj`
 
-This is a linking table created to resolve m:n relationship between Principal and Project tables
+This is a linking table created to resolve m:n relationship between `principal` and `project` tables
 
 ```{sql, pi-proj-tbl}
 CREATE TABLE pi_proj (
@@ -100,9 +93,9 @@ FOREIGN KEY (principal_id) REFERENCES principal(principal_id)
 );
 ```
 
-### site table
+### Site table `site`
 
-Implements JSON text column to deal with disparate data from various project types
+Implements JSON text column to deal with disparate data from various project types.  This column mostly handles habitat observations from seining projects and location data from *seining* and *netting* projects.
 
 **NOTE** JSON col must be the last column (far right or `collect()` triggers an ODBC error: `Invalid Descriptor Index`)
 
@@ -115,11 +108,11 @@ reach VARCHAR(10) NOT NULL,
 year SMALLINT NOT NULL,
 pass SMALLINT,
 crew VARCHAR(20),
-loc_x DECIMAL,
-loc_y DECIMAL,
-epsg SMALLINT,
+--loc_x DECIMAL,  -- test utility of loc data in JSON col
+--loc_y DECIMAL,
+--epsg SMALLINT,
 site_notes VARCHAR(255),
-site_json NVARCHAR(max),                                  -- holds location and "habitat data (SE)
+site_json NVARCHAR(max),                                  -- holds location and "habitat data (SE/TR)
 FOREIGN KEY (pi_proj_id) REFERENCES pi_proj(pi_proj_id)
 );
 
@@ -127,9 +120,11 @@ FOREIGN KEY (pi_proj_id) REFERENCES pi_proj(pi_proj_id)
 
 ___
 
-### trans table
+### Transect table `trans`
 
-```{sql}
+Basicly a JSON col to accomodate all types of transect data collected at the site scale.  Current uses are 138nhs data.  
+
+```{sql trans-tbl}
 CREATE TABLE trans (
 trans_id INT NOT NULL IDENTITY(1,1) PRIMARY KEY,
 site_id VARCHAR(50) NOT NULL,
@@ -140,27 +135,44 @@ FOREIGN KEY (site_id) REFERENCES site(site_id)
 
 ___
 
-### water_qual table
+### Water quality table `water_qual`
+
+Contains all main channel water quality data collected across all projects.  Under current design the water quality for habitats is stored within the `site` table's JSON column.
 
 ```{sql water-qual-tbl}
 CREATE TABLE water_qual (
 water_qual_id INT NOT NULL IDENTITY(1,1) PRIMARY KEY,  -- Auto incremented primary key
 site_id VARCHAR(50) NOT NULL,
-cond_amb SMALLINT,
-cond_spec SMALLINT,
-temp DECIMAL(4, 1),
-secchi SMALLINT,
-water_notes VARCHAR(255)
+water_json NVARCHAR(max),
 FOREIGN KEY (site_id) REFERENCES site(site_id)
 );
 ```
 
+**or**
 
+
+```{sql water-qual-tbl-2}
+CREATE TABLE water_qual (
+water_qual_id INT NOT NULL IDENTITY(1,1) PRIMARY KEY,  -- Auto incremented primary key
+site_id VARCHAR(50) NOT NULL,
+location VARCHAR(10) NOT NULL CHECK (location IN ('MC', 'SC', 'LK', 'OI', 'GP', 'ID', 'FB', 'BA', 'MB', 'CC', 'CO', 
+                                                  'CV', 'ED', 'EM', 'CM', 'FT', 'IT', 'IP', 'MC', 'PO', 'PU', 'RI', 
+                                                  'RF', 'RU', 'SH', 'SC', 'MT', 'TS', 'OT', 'UNK')),
+temperature DECIMAL(3,1),
+secchi SMALLINT,
+amb_conductivity SMALLINT,
+spec_conductivity SMALLINT,
+disolved_oxygen
+FOREIGN KEY (site_id) REFERENCES site(site_id)
+);
+```
 ___
 
-### sample table
+### Sample table `sample`
 
-```{sql site-tbl}
+This table contains **all** effort related data.  Leaves `data_type` and `gear` available to query, all other data is stored in JSON column.  
+
+```{sql sample-tbl}
 CREATE TABLE sample (
 sample_id VARCHAR(50) NOT NULL PRIMARY KEY,
 site_id VARCHAR(50) NOT NULL,
@@ -172,11 +184,14 @@ FOREIGN KEY (site_id) REFERENCES site(site_id)
 
 ```
 
-### `count` table
+### Fish count table `count`
+
+This table contains total catch (`fish_count`) by species aggregated to the sample unit.  It is inclusive of all fish encountered within each sample effort (including those stored on the encounter table)
 
 ```{sql count-tbl}
 CREATE TABLE `count` (
 count_id INT NOT NULL IDENTITY(1,1) PRIMARY KEY,
+species_code
 sample_id VARCHAR(50) NOT NULL,
 species VARCHAR(50) NOT NULL,
 fish_count INTEGER NOT NULL,
@@ -224,11 +239,33 @@ FOREIGN KEY (sample_id) REFERENCES sample(se_effort_id)
 ### enc_pit table
 
 ```{sql}
-CREATE TABLE pittag_enc (
-
+CREATE TABLE pittag (
+pit_id INT NOT NULL IDENTITY(1,1) PRIMARY KEY,
+encounter_id VARCHAR(50)
+pit_type VARCHAR(5),
+pit_num VARCHAR(14),
+pit_recap VARCHAR(1),
+pit_notes VARCHAR(20),
+FOREIGN KEY (encounter_id) REFERENCES encounter(encounter_id)
 )
 
 ```
+
+
+
+```{sql}
+CREATE TABLE floytag (
+floy_id INT NOT NULL IDENTITY(1,1) PRIMARY KEY,
+encounter_id VARCHAR(50)
+floy_color VARCHAR(5),
+pit_num VARCHAR(14),
+pit_recap VARCHAR(1),
+pit_notes VARCHAR(20),
+FOREIGN KEY (encounter_id) REFERENCES encounter(encounter_id)
+)
+
+```
+
 
 ### vial_enc table
 
@@ -255,18 +292,18 @@ Maybe integrate if JSON col in site-tbl is problematic
 CREATE TABLE habitat (
 hab_id INT NOT NULL IDENTITY(1,1) PRIMARY KEY,
 site_id VARCHAR(50) NOT NULL,
-hab_1 TEXT NOT NULL CHECK (hab_1 IN ('MC', 'SC', 'LK', 'OI', 'GP', 'ID', 'FB', 'OT', 'UNK')),
-hab_2 TEXT CHECK (hab_2 IN ('BA', 'MB', 'CC', 'CO', 'CV', 'ED', 'EM', 'CM', 'FT', 'IT', 
+hab_1 VARCHAR(10) NOT NULL CHECK (hab_1 IN ('MC', 'SC', 'LK', 'OI', 'GP', 'ID', 'FB', 'OT', 'UNK')),
+hab_2 VARCHAR(10) CHECK (hab_2 IN ('BA', 'MB', 'CC', 'CO', 'CV', 'ED', 'EM', 'CM', 'FT', 'IT', 
                             'IP', 'MC', 'PO', 'PU', 'RI', 'RF', 'RU', 'SH', 'SC', 'MT', 'TS', 'OT', 'UNK')),
 hab_length INTEGER,
 hab_width INTEGER,
 hab_max_depth INTEGER,
 hab_secchi INTEGER,
 hab_temp REAL,
-hab_geom TEXT,
+hab_geom VARCHAR(50),
 prim_sec INTEGER,
 aspect INTEGER,
-cover_type TEXT,
+cover_type VARCHAR(50),
 pct_cover INTEGER,
 FOREIGN KEY (site_id) REFERENCES site(site_id)
 );
